@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include <stdbool.h>
 #include <stdio.h>
 #include <dbus/dbus.h>
 #include <tinyalsa/asoundlib.h>
@@ -12,16 +13,107 @@ struct pcm_config pcm_config_voice_call = {
 	.format		= PCM_FORMAT_S16_LE,
 };
 
+struct q6voiced {
+	unsigned int card, device;
+	struct pcm *tx, *rx;
+};
+
+static void q6voiced_open(struct q6voiced *v)
+{
+	if (v->tx)
+		return; /* Already active */
+
+	/*
+	 * Opening the PCM devices starts the stream.
+	 * This should be replaced by a codec2codec link probably.
+	 */
+	v->tx = pcm_open(v->card, v->device, PCM_IN, &pcm_config_voice_call);
+	if (!pcm_is_ready(v->tx))
+		perror("Failed to open tx");
+
+	v->rx = pcm_open(v->card, v->device, PCM_OUT, &pcm_config_voice_call);
+	if (!pcm_is_ready(v->rx))
+		perror("Failed to open rx");
+
+	printf("PCM devices were opened.\n");
+}
+
+static void q6voiced_close(struct q6voiced *v)
+{
+	if (!v->tx)
+		return; /* Not active */
+
+	pcm_close(v->rx);
+	pcm_close(v->tx);
+	v->rx = v->tx = NULL;
+
+	printf("PCM devices were closed.\n");
+}
+
+/* See ModemManager-enums.h */
+enum MMCallState {
+	MM_CALL_STATE_DIALING		= 1,
+	MM_CALL_STATE_RINGING_OUT	= 2,
+	MM_CALL_STATE_ACTIVE		= 4,
+};
+
+static bool mm_state_is_active(int state)
+{
+	/*
+	 * Some modems seem to be incapable of reporting DIALING -> ACTIVE.
+	 * Therefore we also consider DIALING/RINGING_OUT as active.
+	 */
+	switch (state) {
+	case MM_CALL_STATE_DIALING:
+	case MM_CALL_STATE_RINGING_OUT:
+	case MM_CALL_STATE_ACTIVE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void handle_signal(struct q6voiced *v, DBusMessage *msg, DBusError *err)
+{
+	// Check if the message is a signal from the correct interface and with the correct name
+	// TODO: Should we also check the call state for oFono?
+	if (dbus_message_is_signal(msg, "org.ofono.VoiceCallManager", "CallAdded")) {
+		q6voiced_open(v);
+	} else if (dbus_message_is_signal(msg, "org.ofono.VoiceCallManager", "CallRemoved")) {
+		q6voiced_close(v);
+	} else if (dbus_message_is_signal(msg, "org.freedesktop.ModemManager1.Call", "StateChanged")) {
+		/*
+		 * For ModemManager call objects are created in advance
+		 * and not necessarily immediately started.
+		 * Need to listen for call state changes.
+		 */
+		int old_state, new_state;
+
+		if (!dbus_message_get_args(msg, err,
+					   DBUS_TYPE_INT32, &old_state,
+					   DBUS_TYPE_INT32, &new_state,
+					   DBUS_TYPE_INVALID))
+			return;
+
+		if (old_state == new_state)
+			return; /* No change */
+
+		if (mm_state_is_active(new_state))
+			q6voiced_open(v);
+		else if (mm_state_is_active(old_state) && !mm_state_is_active(new_state))
+			q6voiced_close(v);
+	}
+}
+
 int main(int argc, char **argv)
 {
-	struct pcm *tx = NULL, *rx = NULL;
-	unsigned int card, device;
+	struct q6voiced v = {0};
 
 	DBusMessage *msg;
 	DBusConnection *conn;
 	DBusError err;
 
-	if (argc != 2 || sscanf(argv[1], "hw:%u,%u", &card, &device) != 2) {
+	if (argc != 2 || sscanf(argv[1], "hw:%u,%u", &v.card, &v.device) != 2) {
 		fprintf(stderr, "Usage: q6voiced hw:<card>,<device>\n");
 		return 1;
 	}
@@ -41,6 +133,7 @@ int main(int argc, char **argv)
 		return 1;
 
 	dbus_bus_add_match(conn, "type='signal',interface='org.ofono.VoiceCallManager'", &err);
+	dbus_bus_add_match(conn, "type='signal',interface='org.freedesktop.ModemManager1.Call'", &err);
 	dbus_connection_flush(conn);
 	if (dbus_error_is_set(&err)) {
 		fprintf(stderr, "Match error: %s\n", err.message);
@@ -48,40 +141,14 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	printf("Listening for VoiceCallManager signals.\n");
-
 	// Loop listening for signals being emmitted
 	while (dbus_connection_read_write(conn, -1)) {
 		// We need to process all received messages
 		while (msg = dbus_connection_pop_message(conn)) {
-			// Check if the message is a signal from the correct interface and with the correct name
-			if (dbus_message_is_signal(msg, "org.ofono.VoiceCallManager", "CallAdded")) {
-				if (!tx) {
-					/*
-					 * Opening the PCM devices starts the stream.
-					 * This should be replaced by a codec2codec link probably.
-					 */
-					tx = pcm_open(card, device, PCM_IN, &pcm_config_voice_call);
-					if (!pcm_is_ready(tx))
-						perror("Failed to open tx");
-
-					rx = pcm_open(card, device, PCM_OUT, &pcm_config_voice_call);
-					if (!pcm_is_ready(rx))
-						perror("Failed to open rx");
-
-					printf("PCM devices were opened.\n");
-				} else
-					printf("PCM is already opened!\n");
-
-			} else if (dbus_message_is_signal(msg, "org.ofono.VoiceCallManager", "CallRemoved")) {
-				if (rx) {
-					pcm_close(rx);
-					pcm_close(tx);
-
-					printf("PCM devices were closed.\n");
-					rx = tx = NULL;
-				} else
-					printf("PCM is already closed!\n");
+			handle_signal(&v, msg, &err);
+			if (dbus_error_is_set(&err)) {
+				fprintf(stderr, "Failed to handle signal: %s\n", err.message);
+				dbus_error_free(&err);
 			}
 
 			dbus_message_unref(msg);
