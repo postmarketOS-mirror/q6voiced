@@ -28,11 +28,10 @@ static void q6voiced_open(struct q6voiced *v)
 	 * This should be replaced by a codec2codec link probably.
 	 */
 	v->tx = pcm_open(v->card, v->device, PCM_IN, &pcm_config_voice_call);
-	if (!pcm_is_ready(v->tx))
-		perror("Failed to open tx");
-
 	v->rx = pcm_open(v->card, v->device, PCM_OUT, &pcm_config_voice_call);
-	if (!pcm_is_ready(v->rx))
+	if (!pcm_is_ready(v->tx) || pcm_prepare(v->tx))
+		perror("Failed to open tx");
+	if (!pcm_is_ready(v->rx) || pcm_prepare(v->rx))
 		perror("Failed to open rx");
 
 	printf("PCM devices were opened.\n");
